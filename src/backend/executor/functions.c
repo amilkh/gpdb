@@ -31,6 +31,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/query_metrics.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -553,7 +554,7 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 								 fcache->paramLI,
 								 (gp_enable_query_metrics ? INSTRUMENT_ROWS : 0));
 
-		if (gp_enable_gpperfmon 
+		if ((gp_enable_gpperfmon || gp_enable_query_metrics)
 			&& Gp_role == GP_ROLE_DISPATCH 
 			&& log_min_messages < DEBUG4)
 		{
@@ -565,6 +566,7 @@ postquel_start(execution_state *es, SQLFunctionCachePtr fcache)
 					application_name,
 					NULL /* resqueue name */,
 					NULL /* priority */);
+			metrics_send_query_info(es->qd, METRICS_QUERY_SUBMIT);
 
 		}
 		else
