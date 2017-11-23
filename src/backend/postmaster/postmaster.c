@@ -127,6 +127,7 @@
 #include "postmaster/syslogger.h"
 #include "postmaster/backoff.h"
 #include "postmaster/perfmon_segmentinfo.h"
+#include "postmaster/bgworker.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -2325,8 +2326,12 @@ ServerLoop(void)
         else
         {
             /* must set timeout each time; some OSes change it! */
-            timeout.tv_sec = 60;
-            timeout.tv_usec = 0;
+
+			/*
+			 * GPDB specific bgworker: change sleep time according to
+			 * bgworkers status
+			 */
+			DetermineSleepTime(&timeout, Shutdown);
         }
 
 #ifdef USE_TEST_UTILS
@@ -2555,6 +2560,12 @@ ServerLoop(void)
 			avlauncher_needs_signal = false;
 			if (AutoVacPID != 0)
 				kill(AutoVacPID, SIGUSR1);
+		}
+
+		/* GPDB specific bgworker: Get other worker processes running, if needed */
+		if (StartWorkerNeeded || HaveCrashedWorker)
+		{
+			StartOneBackgroundWorker(FatalError, pmState, PM_RUN);
 		}
 
 		/*
@@ -4058,7 +4069,11 @@ pmdie(SIGNAL_ARGS)
 			ereport(LOG,
 					(errmsg("received smart shutdown request"),
 					 errSendAlert(true)));
-
+			if (pmState == PM_RUN)
+			{
+				/* GPDB specific bgworker: bgworkers are told to shut down immediately */
+				SignalUnconnectedWorkers(SIGTERM, &signal_child);
+			}
 			need_call_reaper = true;
 			if ( pmState < PM_CHILD_STOP_BEGIN)
 			    pmState = PM_CHILD_STOP_BEGIN;
@@ -4090,6 +4105,9 @@ pmdie(SIGNAL_ARGS)
                 pmStateMachineMustRunActions = true;
             }
             signal_child_if_up(FilerepPeerResetPID, SIGQUIT);
+
+			/* GPDB specific bgworker: bgworkers are told to shut down*/
+			SignalUnconnectedWorkers(SIGTERM, &signal_child);
             break;
 
 		case SIGQUIT:
@@ -4120,6 +4138,9 @@ pmdie(SIGNAL_ARGS)
             signal_child_if_up(PgArchPID, SIGQUIT);
             signal_child_if_up(PgStatPID, SIGQUIT);
             signal_child_if_up(FilerepPeerResetPID, SIGQUIT);
+
+			/* GPDB specific bgworker: bgworkers are told to shut down*/
+			SignalUnconnectedWorkers(SIGQUIT, &signal_child);
 
             /* if you add more processes here then also update do_immediate_shutdown_reaper */
 
@@ -4679,6 +4700,10 @@ do_reaper()
 			 */
 			if (CommenceNormalOperations())
 				didServiceProcessWork &= true;
+			
+			/* Background worker is set to be started when pMstate=PM_RUN */
+			StartOneBackgroundWorker(FatalError, pmState, PM_RUN);
+
 			continue;
 		}
 
@@ -4973,6 +4998,14 @@ do_reaper()
 			continue;
 		}
 
+		/* GPDB specific bgworker:Was it one of background workers? */
+		if (CleanupBackgroundWorker(pid, exitstatus, &HandleChildCrash, &LogChildExit))
+		{
+			/* have it be restarted */
+			HaveCrashedWorker = true;
+			continue;
+		}
+
 		/*
 		 * Else do standard backend child cleanup.
 		 */
@@ -5250,7 +5283,7 @@ CleanupBackend(int pid,
 
 /*
  * HandleChildCrash -- cleanup after failed backend, bgwriter, walwriter,
- * or autovacuum.
+ * autovacuum or background worker.
  *
  * The objectives here are to clean up our local state about the child
  * process, and to signal all other remaining children to quickdie.
@@ -5265,6 +5298,9 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	Dlelem	   *curr,
 			   *next;
 	Backend    *bp;
+
+	/* GPDB specific bgworker: cleanup bgworker process */
+	HandleBgworkerCrash(pid, &signal_child, FatalError, SendStop);
 
 	/*
 	 * Make log entry unless there was a previous crash (if so, nonzero exit
@@ -5654,6 +5690,7 @@ StateMachineCheck_WaitBackends(void)
         bool autovacShutdown = AutoVacPID == 0;
 
         if (childCount == 0 &&
+			CountUnconnectedWorkers() == 0 && /* GPDB specific bgworker */
 			WalReceiverPID == 0 &&
 			WalWriterPID == 0 &&
             (BgWriterPID == 0 || !FatalError) && /* todo: CHAD_PM why wait for BgWriterPID here?  Can't we just allow
